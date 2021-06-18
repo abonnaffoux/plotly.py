@@ -37,7 +37,7 @@ def validate_streamline(x, y):
 
 
 def create_streamline(
-    x, y, u, v, density=1, angle=math.pi / 9, arrow_scale=0.09, **kwargs
+    x, y, u, v, density=1, angle=math.pi / 9, arrow_scale=0.09, min_speed_thrs=1E-6, **kwargs
 ):
     """
     Returns data for a streamline plot.
@@ -53,6 +53,7 @@ def create_streamline(
     :param (angle in radians) angle: angle of arrowhead. Default = pi/9
     :param (float in [0,1]) arrow_scale: value to scale length of arrowhead
         Default = .09
+    :param (float|int) min_speed_thrs: minimum speed to plot a streamline
     :param kwargs: kwargs passed through plotly.graph_objs.Scatter
         for more information on valid kwargs call
         help(plotly.graph_objs.Scatter)
@@ -114,35 +115,36 @@ def create_streamline(
     validate_streamline(x, y)
     utils.validate_positive_scalars(density=density, arrow_scale=arrow_scale)
 
-    streamline_x, streamline_y = _Streamline(
-        x, y, u, v, density, angle, arrow_scale
-    ).sum_streamlines()
+    streamline_x, streamline_y, streamline_speed = _Streamline(
+        x, y, u, v, density, angle, arrow_scale, min_speed_thrs
+    ).return_streamlines()
     arrow_x, arrow_y = _Streamline(
-        x, y, u, v, density, angle, arrow_scale
+        x, y, u, v, density, angle, arrow_scale, min_speed_thrs
     ).get_streamline_arrows()
 
-    streamline = graph_objs.Scatter(
-        x=streamline_x + arrow_x, y=streamline_y + arrow_y, mode="lines", **kwargs
-    )
-
-    data = [streamline]
+    arrows = graph_objs.Scatter(x=arrow_x, y=arrow_y, mode="lines", line={'color': 'black', 'width': 3}, **kwargs)
     layout = graph_objs.Layout(hovermode="closest")
+    fig = graph_objs.Figure(data=[arrows], layout=layout)
 
-    return graph_objs.Figure(data=data, layout=layout)
+    for ii in range(len(streamline_x)):
+        fig.add_trace(graph_objs.Scatter(x=streamline_x[ii], y=streamline_y[ii], mode="lines",
+                                         line={'color':'red', 'width': streamline_speed[ii]/np.mean(streamline_speed)*4}, **kwargs))
 
+    return fig
 
 class _Streamline(object):
     """
     Refer to FigureFactory.create_streamline() for docstring
     """
 
-    def __init__(self, x, y, u, v, density, angle, arrow_scale, **kwargs):
+    def __init__(self, x, y, u, v, density, angle, arrow_scale, min_speed_thrs, **kwargs):
         self.x = np.array(x)
         self.y = np.array(y)
         self.u = np.array(u)
         self.v = np.array(v)
         self.angle = angle
         self.arrow_scale = arrow_scale
+        self.min_speed_thrs = min_speed_thrs
         self.density = int(30 * density)  # Scale similarly to other functions
         self.delta_x = self.x[1] - self.x[0]
         self.delta_y = self.y[1] - self.y[0]
@@ -166,7 +168,7 @@ class _Streamline(object):
         self.st_x = []
         self.st_y = []
         self.get_streamlines()
-        streamline_x, streamline_y = self.sum_streamlines()
+        streamline_x, streamline_y, streamline_speed = self.sum_streamlines()
         arrows_x, arrows_y = self.get_streamline_arrows()
 
     def blank_pos(self, xi, yi):
@@ -204,16 +206,22 @@ class _Streamline(object):
         """
 
         def f(xi, yi):
-            dt_ds = 1.0 / self.value_at(self.speed, xi, yi)
-            ui = self.value_at(self.u, xi, yi)
-            vi = self.value_at(self.v, xi, yi)
-            return ui * dt_ds, vi * dt_ds
+            if self.value_at(self.speed, xi, yi) > 0:
+                dt_ds = 1.0 / self.value_at(self.speed, xi, yi)
+                ui = self.value_at(self.u, xi, yi)
+                vi = self.value_at(self.v, xi, yi)
+                return ui * dt_ds, vi * dt_ds
+            else:
+                return 0.0, 0.0
 
         def g(xi, yi):
-            dt_ds = 1.0 / self.value_at(self.speed, xi, yi)
-            ui = self.value_at(self.u, xi, yi)
-            vi = self.value_at(self.v, xi, yi)
-            return -ui * dt_ds, -vi * dt_ds
+            if self.value_at(self.speed, xi, yi) > 0:
+                dt_ds = 1.0 / self.value_at(self.speed, xi, yi)
+                ui = self.value_at(self.u, xi, yi)
+                vi = self.value_at(self.v, xi, yi)
+                return -ui * dt_ds, -vi * dt_ds
+            else:
+                return 0.0, 0.0
 
         check = lambda xi, yi: (0 <= xi < len(self.x) - 1 and 0 <= yi < len(self.y) - 1)
         xb_changes = []
@@ -227,6 +235,8 @@ class _Streamline(object):
             xb, yb = self.blank_pos(xi, yi)
             xf_traj = []
             yf_traj = []
+            ii_mean_speed = 0
+            mean_speed = 0
             while check(xi, yi):
                 xf_traj.append(xi)
                 yf_traj.append(yi)
@@ -237,11 +247,18 @@ class _Streamline(object):
                     k4x, k4y = f(xi + ds * k3x, yi + ds * k3y)
                 except IndexError:
                     break
-                xi += ds * (k1x + 2 * k2x + 2 * k3x + k4x) / 6.0
-                yi += ds * (k1y + 2 * k2y + 2 * k3y + k4y) / 6.0
+                vxi = (k1x + 2 * k2x + 2 * k3x + k4x) / 6.0
+                vyi = (k1y + 2 * k2y + 2 * k3y + k4y) / 6.0
+                speed = np.sqrt(vxi**2 + vyi**2)
+                if speed < self.min_speed_thrs:
+                    break
+                xi += ds * vxi
+                yi += ds * vyi
                 if not check(xi, yi):
                     break
                 stotal += ds
+                mean_speed = (mean_speed * ii_mean_speed + speed) / (ii_mean_speed + 1)
+                ii_mean_speed += 1
                 new_xb, new_yb = self.blank_pos(xi, yi)
                 if new_xb != xb or new_yb != yb:
                     if self.blank[new_yb, new_xb] == 0:
@@ -254,11 +271,12 @@ class _Streamline(object):
                         break
                 if stotal > 2:
                     break
-            return stotal, xf_traj, yf_traj
+            return stotal, xf_traj, yf_traj, mean_speed
 
-        sf, xf_traj, yf_traj = rk4(x0, y0, f)
-        sb, xb_traj, yb_traj = rk4(x0, y0, g)
+        sf, xf_traj, yf_traj, speed_f = rk4(x0, y0, f)
+        sb, xb_traj, yb_traj, speed_b = rk4(x0, y0, g)
         stotal = sf + sb
+        speed = speed_f + speed_b
         x_traj = xb_traj[::-1] + xf_traj[1:]
         y_traj = yb_traj[::-1] + yf_traj[1:]
 
@@ -267,7 +285,7 @@ class _Streamline(object):
         if stotal > 0.2:
             initxb, inityb = self.blank_pos(x0, y0)
             self.blank[inityb, initxb] = 1
-            return x_traj, y_traj
+            return x_traj, y_traj, speed
         else:
             for xb, yb in zip(xb_changes, yb_changes):
                 self.blank[yb, xb] = 0
@@ -307,6 +325,8 @@ class _Streamline(object):
         self.st_y = [
             np.array(t[1]) * self.delta_y + self.y[0] for t in self.trajectories
         ]
+
+        self.st_speed = [t[2] for t in self.trajectories]
 
         for index in range(len(self.st_x)):
             self.st_x[index] = self.st_x[index].tolist()
@@ -405,4 +425,16 @@ class _Streamline(object):
         """
         streamline_x = sum(self.st_x, [])
         streamline_y = sum(self.st_y, [])
-        return streamline_x, streamline_y
+        streamline_speed = sum(self.st_speed, [])
+        return streamline_x, streamline_y, streamline_speed
+
+    def return_streamlines(self):
+        """
+        Returns a LIST of streamline as a list of trace
+
+        :rtype (list, list): streamline_x: all x values for each streamline
+            combined into single list and streamline_y: all y values for each
+            streamline combined into single list
+        """
+
+        return self.st_x, self.st_y, self.st_speed
